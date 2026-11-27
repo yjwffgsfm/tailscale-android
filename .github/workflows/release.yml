@@ -1,0 +1,170 @@
+name: Release APK
+
+# 推送以 "v" 开头的 tag 时，自动构建汉化版 APK 并附加到 GitHub Release：
+#
+#   git tag v1.0.0
+#   git push origin v1.0.0
+#
+# 可选仓库密钥（Settings > Secrets and variables > Actions）：
+#
+#   ANDROID_KEYSTORE_BASE64     release 签名用的 .jks keystore 的 base64
+#   ANDROID_KEYSTORE_PASSWORD   keystore 密码
+#   ANDROID_KEY_ALIAS           密钥别名（默认 tailscale）
+#   ANDROID_KEY_PASSWORD        密钥密码（默认与 keystore 密码相同）
+#
+# 未配置 keystore 时，APK 使用 CI 的 debug 密钥签名（AGP signingConfig 回落）：
+# 可以侧载安装，但无法覆盖安装官方版本。
+
+on:
+  push:
+    tags:
+      - "v*"
+  # 允许在 Actions 页面手动重跑，无需重新推 tag。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Gradle assembleRelease 依赖 android/libs/libtailscale.aar，由 make 生成。
+  # 与 android/build.gradle.kts 中的 ndkVersion 保持一致。
+  NDK_VERSION: "23.1.7779620"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # mkversion 从 git 历史推导版本号，因此需要完整历史和 tag。
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
+        with:
+          go-version-file: "go.mod"
+          cache: false
+
+      - name: Set up Java 21
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@07976c6290703d34c16d382cb36445f98bb43b1f # v3.2.0
+        with:
+          # compileSdk / targetSdk / buildTools 全部取自 android/gradle.properties。
+          packages: "platforms;android-37.0 platforms;android-36 build-tools;36.0.0 platform-tools ndk;23.1.7779620"
+
+      - name: Verify Android SDK layout
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME"
+          ls "$ANDROID_HOME/ndk"
+          test -d "$ANDROID_HOME/ndk/$NDK_VERSION" || {
+            echo "NDK $NDK_VERSION not found under $ANDROID_HOME/ndk" >&2
+            exit 1
+          }
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Cache Go toolchain and modules
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cache/tailscale-go
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum', 'go.toolchain.rev') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Cache Gradle
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android/gradle/libs.versions.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Configure optional release signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          # 签名交给 AGP 的 signingConfigs（android/build.gradle.kts 里的 releaseFromEnv）。
+          # 绝不能在构建后再 zip -d META-INF/* + jarsigner 重签：那样会删掉
+          # META-INF/MANIFEST.MF，一旦重签没成功，装出来的包就是「未包含任何证书」。
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "未配置 ANDROID_KEYSTORE_BASE64，将回落到 AGP 的 debug 签名。"
+            exit 0
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks"
+            echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "ANDROID_KEY_ALIAS=${KEY_ALIAS:-tailscale}"
+            echo "ANDROID_KEY_PASSWORD=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        run: |
+          set -euo pipefail
+
+          # 完整走 Makefile：生成 tailscale.version 与 android/libs/libtailscale.aar
+          # （gomobile bind 需要 NDK）。两者都是 assembleRelease 的前置产物，不在仓库里。
+          # 注意不要用 make tailscale-debug.apk / assembleDebug：debug 包会多出 MDM 菜单，
+          # 且 DebugPolicies 会整体替换真实 MDM 策略。
+          make gradle-dependencies
+
+          # AGP 负责最终签名（未配置密钥时回落为 debug 签名）。
+          (cd android && ./gradlew --no-daemon assembleRelease)
+
+          apk_in="$(find android/build/outputs/apk/release -name '*.apk' -print -quit)"
+          if [ -z "$apk_in" ]; then
+            echo "构建未产出 release APK" >&2
+            exit 1
+          fi
+          echo "built: $apk_in"
+
+          # 优先用 tag 名（如 v1.0.0）做产物名，便于区分版本。
+          version="${GITHUB_REF_NAME:-}"
+          if [ -z "$version" ]; then
+            version="dev-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          fi
+          out="tailscale-android-zh-${version}.apk"
+          # 只做复制，不做任何重打包。任何对 zip 的重写都会破坏 v1/v2 签名。
+          cp "$apk_in" "$out"
+
+          # 确认这张 APK 确实带了证书；不带证书时 verify 非零退出，直接让任务失败，
+          # 避免把无法安装的包发布出去。
+          apksigner="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort | tail -1)"
+          echo "using $apksigner"
+          "$apksigner" verify --print-certs "$out"
+
+          sha256sum "$out" | tee "$out.sha256"
+          {
+            echo "APK=$out"
+            echo "SHA=$out.sha256"
+          } >> "$GITHUB_ENV"
+
+      # 只上传附件；Release 的标题与正文由仓库维护者自己写，这里不传 name / body /
+      # generate_release_notes，避免每次发版都把人工写好的说明覆盖掉。
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            ${{ env.APK }}
+            ${{ env.SHA }}
+          fail_on_unmatched_files: true

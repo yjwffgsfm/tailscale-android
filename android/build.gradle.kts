@@ -49,6 +49,24 @@ android {
   flavorDimensions += "version"
   namespace = "com.tailscale.ipn"
 
+  // 本地/CI 发布签名：由 AGP 在构建时签名，不在构建后做 zip -d + jarsigner 重签
+  // （那样会删掉 META-INF/MANIFEST.MF，重签失败时安装会提示「该安装包未包含任何证书」）。
+  // 密钥路径由环境变量 ANDROID_KEYSTORE_PATH 提供；未提供时回落为 debug 签名，
+  // 产物可以侧载安装，但无法覆盖安装官方签名版本。
+  signingConfigs {
+    create("releaseFromEnv") {
+      val storePath = System.getenv("ANDROID_KEYSTORE_PATH")
+      if (storePath != null && File(storePath).exists()) {
+        storeFile = File(storePath)
+        storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+        keyAlias = System.getenv("ANDROID_KEY_ALIAS") ?: "tailscale"
+        keyPassword =
+            System.getenv("ANDROID_KEY_PASSWORD")
+                ?: System.getenv("ANDROID_KEYSTORE_PASSWORD")
+      }
+    }
+  }
+
   buildTypes {
     debug { manifestPlaceholders["leanbackRequired"] = isTV() }
 
@@ -56,6 +74,12 @@ android {
       manifestPlaceholders["leanbackRequired"] = isTV()
       isMinifyEnabled = true
       isShrinkResources = true
+
+      // 没有显式 signingConfig 时，assembleRelease 产出的是「未签名」APK，装不上手机。
+      signingConfig =
+          if (System.getenv("ANDROID_KEYSTORE_PATH") != null)
+              signingConfigs.getByName("releaseFromEnv")
+          else signingConfigs.getByName("debug")
 
       proguardFiles(
           getDefaultProguardFile("proguard-android-optimize.txt"),

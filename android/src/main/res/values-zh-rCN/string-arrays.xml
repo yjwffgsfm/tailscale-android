@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- MDM 应用限制界面里的下拉选项标签。条目数必须与 values/string-arrays.xml 一一对应：
+         顺序即取值顺序，改顺序会让策略选项与保存的值错位。
+         注：values/string-arrays.xml 里 *_labels 这几组写的是 translatable="true"。 -->
+    <string-array name="hidden_network_devices_labels" translatable="true">
+        <item>当前用户的设备</item>
+        <item>其他用户的设备</item>
+        <item>带标签的设备</item>
+    </string-array>
+    <string-array name="always_never_userdecides_labels" translatable="true">
+        <item>始终</item>
+        <item>从不</item>
+        <item>由用户决定</item>
+    </string-array>
+    <string-array name="show_hide_labels" translatable="true">
+        <item>显示</item>
+        <item>隐藏</item>
+    </string-array>
+</resources>
